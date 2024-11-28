@@ -16,3 +16,6 @@ tests/test_data
 build/
 *_bak
 timetable_*
+
+run_gamma_das.py
+run_gamma.py

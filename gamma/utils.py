@@ -11,6 +11,9 @@ from sklearn.cluster import DBSCAN
 from ._bayesian_mixture import BayesianGaussianMixture
 from ._gaussian_mixture import GaussianMixture
 from .seismic_ops import calc_amp, calc_time, initialize_eikonal
+import logging
+logger = logging.getLogger('gamma_logger')
+
 
 to_seconds = lambda t: t.timestamp(tz="UTC")
 from_seconds = lambda t: pd.Timestamp.utcfromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
@@ -48,7 +51,7 @@ def convert_picks_csv(picks, stations, config):
     timestamp0 = np.min(t)
     t = t - timestamp0
     if config["use_amplitude"]:
-        a = picks["amp"].apply(lambda x: np.log10(x * 1e2)).to_numpy()  ##cm/s
+        a = picks["amp"].apply(lambda x: np.log10(x * 1e2)).to_numpy()  ##cm/s (PGV, PGA)
         data = np.stack([t, a]).T
     else:
         data = t[:, np.newaxis]
@@ -96,7 +99,7 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
 
         labels = db.labels_
         unique_labels = set(labels)
-        unique_labels = unique_labels.difference([-1])
+        unique_labels = unique_labels.difference([-1]) # -1 represents the noise
     else:
         labels = np.zeros(len(data))
         unique_labels = [0]
@@ -130,16 +133,16 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
             events.extend(events_)
             assignment.extend(assignment_)
     else:
-        manager = mp.Manager()
-        lock = manager.Lock()
+        manager = mp.Manager() # create a shared manager
+        lock = manager.Lock() 
         # event_idx0 - 1 as event_idx is increased before use
-        event_idx = manager.Value("i", event_idx0 - 1)
+        event_idx = manager.Value("i", event_idx0 - 1) # create a variable
 
         print(f"Associating {len(unique_labels)} clusters with {config['ncpu']} CPUs")
 
         # the following sort and shuffle is to make sure jobs are distributed evenly
-        counter = Counter(labels)
-        unique_labels = sorted(unique_labels, key=lambda x: counter[x], reverse=True)
+        counter = Counter(labels) # counting the frequency of each label
+        unique_labels = sorted(unique_labels, key=lambda x: counter[x], reverse=True) # based on the frequenct to sort the label
         np.random.shuffle(unique_labels)
 
         # the default chunk_size is len(unique_labels)//(config["ncpu"]*4), which makes some jobs very heavy
@@ -173,8 +176,8 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
                         lock,
                     ]
                     for k in unique_labels
-                ],
-                chunksize=chunk_size,
+                ], # this generate a list contains diff k as input
+                chunksize=chunk_size, # how many chunks would be allocated to the Process
             )
             # resuts is a list of tuples, each tuple contains two lists events and assignment
             # here we flatten the list of tuples into two lists
@@ -202,7 +205,7 @@ def associate(
     event_idx,
     lock=None,
 ):
-    print(".", end="")
+    print(".", end="") # using end to ignore new line
 
     data_ = data[labels == k]
     locs_ = locs[labels == k]
@@ -216,7 +219,7 @@ def associate(
     if len(pick_idx_) < max(3, config["min_picks_per_eq"]):
         return [], []
 
-    time_range = max(data_[:, 0].max() - data_[:, 0].min(), 1)
+    time_range = max(data_[:, 0].max() - data_[:, 0].min(), 1) # 最晚的picks time - 最早的picks time
     if config["use_amplitude"]:
         amp_range = max(data_[:, 1].max() - data_[:, 1].min(), 1)
 
@@ -230,11 +233,13 @@ def associate(
     else:
         # covariance_prior_pre = [5.0, 2.0]
         ## TODO: design a smark way to set covariance_prior
+        logger.info("setting the covariance prior")
         weight = np.squeeze(phase_weight_)
         x_mean = np.average(locs_[:, 0], weights=weight)
         y_mean = np.average(locs_[:, 1], weights=weight)
         x_std = np.sqrt(np.average((locs_[:, 0] - x_mean) ** 2, weights=weight))
         y_std = np.sqrt(np.average((locs_[:, 1] - y_mean) ** 2, weights=weight))
+        logger.info(f"weight: {weight}\nx_mean: {x_mean}\ny_mean: {y_mean}\nx_std: {x_std}\ny_std: {y_std}")
         # x_std = np.std(locs_[:, 0])
         # y_std = np.std(locs_[:, 1])
         # t_std = np.std(data_[:, 0])
@@ -249,6 +254,7 @@ def associate(
         rstd = np.sqrt(x_std**2 + y_std**2)
         # scaler = max(10.0, (rstd / 6.0) * (rstd / 60.0))  # 6.0 km/s, 60 km
         scaler = max(1.0, (rstd / 6.0) * (rstd / 60.0))  # 6.0 km/s, 60 km
+        logger.info(f"scaler: {scaler}")
         if config["use_amplitude"]:
             # covariance_prior_pre = [time_range * 10.0, amp_range * 10.0]
             covariance_prior_pre = [scaler, scaler]
@@ -373,7 +379,7 @@ def associate(
                 continue
 
         if lock is not None:
-            with lock:
+            with lock: # using with lock to ensure only one process pass.
                 if not isinstance(event_idx, int):
                     event_idx.value += 1
                     event_idx_value = event_idx.value
@@ -498,17 +504,17 @@ def init_centers(config, data_, locs_, time_range, max_num_event=1):
     else:
         initial_points = [1, 1, 1]
 
-    num_t_init = min(max(int(max_num_event * config["oversample_factor"]), 1), len(data_))
+    num_t_init = min(max(int(max_num_event * config["oversample_factor"]), 1), len(data_)) 
 
-    index = np.argsort(data_[:, 0])[:: max(len(data_) // num_t_init, 1)][:num_t_init]
-    t_init = data_[index, 0]
+    index = np.argsort(data_[:, 0])[:: max(len(data_) // num_t_init, 1)][:num_t_init] 
+    t_init = data_[index, 0] # selecting initial time in specific step (which is index)
     x_init = locs_[:, 0][index]
     y_init = locs_[:, 1][index]
     # x_init, y_init = np.mean(locs_[:, 0]), np.mean(locs_[:, 1])
     # x_init = np.broadcast_to(x_init, (num_t_init)).reshape(-1)
     # y_init = np.broadcast_to(y_init, (num_t_init)).reshape(-1)
-    z_init = np.linspace(config["z(km)"][0], config["z(km)"][1], initial_points[2] + 2)[1:-1]
-    z_init = np.broadcast_to(z_init, (num_t_init)).reshape(-1)
+    z_init = np.linspace(config["z(km)"][0], config["z(km)"][1], initial_points[2] + 2)[1:-1] # select the middle item
+    z_init = np.broadcast_to(z_init, (num_t_init)).reshape(-1) # creating the depth part following the array size above
 
     if config["dims"] == ["x(km)", "y(km)", "z(km)"]:
         centers_init = np.vstack([x_init, y_init, z_init, t_init]).T

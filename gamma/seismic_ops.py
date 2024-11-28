@@ -6,7 +6,8 @@ import numpy as np
 import scipy.optimize
 from numba import njit
 from numba.typed import List
-
+import logging
+logger = logging.getLogger('gamma_logger')
 # import shelve
 
 ###################################### Eikonal Solver ######################################
@@ -60,8 +61,8 @@ def sweeping(u, v, h):
     # I = list(range(m))
     # I = List()
     # [I.append(i) for i in range(m)]
-    I = np.arange(m)
-    iI = I[::-1]
+    I = np.arange(m) # 平面的座標 r
+    iI = I[::-1] # Reverse
     # J = list(range(n))
     # J = List()
     # [J.append(j) for j in range(n)]
@@ -343,9 +344,9 @@ def initialize_eikonal(config):
 
     vel = config["vel"]
     zz, vp, vs = vel["z"], vel["p"], vel["s"]
-    vp1d = np.interp(zgrid, zz, vp)
+    vp1d = np.interp(zgrid, zz, vp) # ensuring that zgrid get the vp value, if the grid is not match to the zz, interpolation will be conducted.
     vs1d = np.interp(zgrid, zz, vs)
-    vp = np.ones((nr, nz)) * vp1d
+    vp = np.ones((nr, nz)) * vp1d # vp的 r,z 2D model
     vs = np.ones((nr, nz)) * vs1d
 
     ir0 = np.around((0 - rlim[0]) / h).astype(np.int64)

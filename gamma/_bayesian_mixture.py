@@ -20,7 +20,8 @@ from ._gaussian_mixture import (
     _estimate_log_gaussian_prob,
 )
 from .seismic_ops import *
-
+import logging
+logger = logging.getLogger('gamma_logger')
 
 def _log_dirichlet_norm(dirichlet_concentration):
     """Compute the log of the Dirichlet distribution normalization term.

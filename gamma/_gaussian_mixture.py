@@ -12,7 +12,8 @@ from sklearn.utils.validation import _deprecate_positional_args
 
 from .seismic_ops import *
 from ._base import BaseMixture, _check_shape
-
+import logging
+logger = logging.getLogger('gamma_logger')
 ###############################################################################
 # Gaussian mixture shape checkers used by the GaussianMixture class
 
@@ -162,7 +163,7 @@ def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
     covariances = np.empty((n_components, n_features, n_features))
     for k in range(n_components):
         diff = X - means[k]
-        covariances[k] = np.dot(resp[:, k] * diff.T, diff) / nk[k]
+        covariances[k] = np.dot(resp[:, k] * diff.T, diff) / nk[k] # equation 11
         covariances[k].flat[::n_features + 1] += reg_covar
     return covariances
 

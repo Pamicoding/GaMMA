@@ -17,7 +17,8 @@ from sklearn.utils import check_array, check_random_state
 from sklearn.utils.validation import check_is_fitted
 
 from .seismic_ops import initialize_centers
-
+import logging
+logger = logging.getLogger('gamma_logger')
 def _check_shape(param, param_shape, name):
     """Validate the shape of the input parameter 'param'.
 
@@ -229,11 +230,11 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
             Component labels.
         """
         X = _check_X(X, self.n_components, ensure_min_samples=2)
-        self._check_n_features(X, reset=True)
+        self._check_n_features(X, reset=True) # This method is inherit from BaseEstimator
         self._check_initial_parameters(X)
 
         # if we enable warm_start, we will have a unique initialisation
-        do_init = not(self.warm_start and hasattr(self, 'converged_'))
+        do_init = not(self.warm_start and hasattr(self, 'converged_')) # This is True
         n_init = self.n_init if do_init else 1
 
         max_lower_bound = -np.infty
@@ -242,7 +243,7 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
         random_state = check_random_state(self.random_state)
 
         n_samples, _ = X.shape
-        for init in range(n_init):
+        for init in range(n_init): # init = 0
             self._print_verbose_msg_init_beg(init)
 
             if do_init:
@@ -255,7 +256,7 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
 
                 log_prob_norm, log_resp = self._e_step(X)
                 self._m_step(X, log_resp)
-                lower_bound = self._compute_lower_bound(
+                lower_bound = self._compute_lower_bound( # Because this object will be inherited by BGMM, so this method is in BGMM object.
                     log_resp, log_prob_norm)
 
                 change = lower_bound - prev_lower_bound
