@@ -1,3 +1,4 @@
+import logging
 import multiprocessing as mp
 import platform
 from collections import Counter
@@ -11,12 +12,14 @@ from sklearn.cluster import DBSCAN
 from ._bayesian_mixture import BayesianGaussianMixture
 from ._gaussian_mixture import GaussianMixture
 from .seismic_ops import calc_amp, calc_time, initialize_eikonal
-import logging
-logger = logging.getLogger('gamma_logger')
+
+logger = logging.getLogger("gamma_logger")
 
 
 to_seconds = lambda t: t.timestamp(tz="UTC")
-from_seconds = lambda t: pd.Timestamp.utcfromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+from_seconds = lambda t: pd.Timestamp.utcfromtimestamp(t).strftime(
+    "%Y-%m-%dT%H:%M:%S.%f"
+)[:-3]
 # to_seconds = lambda t: datetime.strptime(t, "%Y-%m-%dT%H:%M:%S.%f").timestamp()
 # from_seconds = lambda t: [datetime.utcfromtimestamp(x).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] for x in t]
 
@@ -41,17 +44,25 @@ def estimate_eps(stations, vp, sigma=3.0):
 def convert_picks_csv(picks, stations, config):
     # t = picks["timestamp"].apply(lambda x: x.timestamp()).to_numpy()
     if type(picks["timestamp"].iloc[0]) is str:
-        picks.loc[:, "timestamp"] = picks["timestamp"].apply(lambda x: datetime.fromisoformat(x))
+        picks.loc[:, "timestamp"] = picks["timestamp"].apply(
+            lambda x: datetime.fromisoformat(x)
+        )
     t = (
         picks["timestamp"]
-        .apply(lambda x: x.tz_convert("UTC").timestamp() if x.tzinfo is not None else x.tz_localize("UTC").timestamp())
+        .apply(
+            lambda x: x.tz_convert("UTC").timestamp()
+            if x.tzinfo is not None
+            else x.tz_localize("UTC").timestamp()
+        )
         .to_numpy()
     )
     # t = picks["timestamp"].apply(lambda x: x.timestamp()).to_numpy()
     timestamp0 = np.min(t)
     t = t - timestamp0
     if config["use_amplitude"]:
-        a = picks["amp"].apply(lambda x: np.log10(x * 1e2)).to_numpy()  ##cm/s (PGV, PGA)
+        a = (
+            picks["amp"].apply(lambda x: np.log10(x * 1e2)).to_numpy()
+        )  ##cm/s (PGV, PGA)
         data = np.stack([t, a]).T
     else:
         data = t[:, np.newaxis]
@@ -72,9 +83,64 @@ def convert_picks_csv(picks, stations, config):
     )
 
 
+def hierarchical_dbscan_clustering(
+    data, phase_loc, phase_type, phase_weight, vel, eps=15, min_samples=3
+):
+    def dbscan2(t, xy, w, ph, vel, eps, min_samples, ratio=1.1):
+        data = np.hstack([t * ratio, xy / vel["p"]])  # time, x, y
+        db_ = DBSCAN(eps=eps, min_samples=min_samples).fit(
+            data, sample_weight=np.squeeze(w, axis=-1)
+        )
+
+        return db_.labels_
+
+    db = DBSCAN(eps=eps, min_samples=min_samples).fit(
+        np.hstack([data[:, 0:1], phase_loc[:, :2] / vel["p"]]),  # time, x, y
+        sample_weight=np.squeeze(phase_weight, axis=-1),
+    )
+
+    labels = db.labels_
+    unique_labels = np.unique(labels)
+    current_label = labels.max() + 1
+    ratio = 1
+
+    for _ in range(20):
+        ratio *= 1.5
+        unique_labels = np.unique(labels)
+        current_label = unique_labels.max() + 1
+        keep_split = False
+
+        for label in unique_labels:
+            if label == -1:
+                continue
+
+            idx = labels == label
+            t = data[idx, 0:1]
+            if (t.max() - t.min()) < 800:  # s
+                continue
+
+            xy = phase_loc[idx, :2]
+            w = phase_weight[idx]
+            ph = phase_type[idx]
+
+            labels_ = dbscan2(
+                t, xy, w, ph, vel, eps=eps, min_samples=min_samples, ratio=ratio
+            )
+            labels_ = np.where(labels_ == -1, -1, labels_ + current_label)
+            labels[idx] = labels_
+
+            current_label += labels_.max() + 1
+            keep_split = True
+
+        if not keep_split:
+            break
+
+    return labels
+
+
 def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
-    data, locs, phase_type, phase_weight, pick_idx, pick_station_id, timestamp0 = convert_picks_csv(
-        picks, stations, config
+    data, locs, phase_type, phase_weight, pick_idx, pick_station_id, timestamp0 = (
+        convert_picks_csv(picks, stations, config)
     )
 
     if len(data) < config["min_picks_per_eq"]:
@@ -87,25 +153,30 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
         config["eikonal"] = initialize_eikonal(config["eikonal"])
 
     if ("use_dbscan" in config) and config["use_dbscan"]:
-        # db = DBSCAN(eps=config["dbscan_eps"], min_samples=config["dbscan_min_samples"]).fit(data[:, 0:1])
-        db = DBSCAN(eps=config["dbscan_eps"], min_samples=config["dbscan_min_samples"]).fit(
-            np.hstack([data[:, 0:1], locs[:, :2] / np.average(vel["p"])]),
-            sample_weight=np.squeeze(phase_weight),
-        )
         # db = DBSCAN(eps=config["dbscan_eps"], min_samples=config["dbscan_min_samples"]).fit(
-        #     np.hstack([data[:, 0:1], locs[:, :2] / np.average(vel["p"]) / np.array([3.0, 1.0])]),
+        #     np.hstack([data[:, 0:1], locs[:, :2] / np.average(vel["p"])]),
         #     sample_weight=np.squeeze(phase_weight),
         # )
-
-        labels = db.labels_
+        # labels = db.labels_
+        labels = hierarchical_dbscan_clustering(
+            data,
+            locs,
+            phase_type,
+            phase_weight,
+            vel,
+            eps=config["dbscan_eps"],
+            min_samples=config["dbscan_min_samples"],
+        )
         unique_labels = set(labels)
-        unique_labels = unique_labels.difference([-1]) # -1 represents the noise
+        unique_labels = unique_labels.difference([-1])  # -1 represents the noise
     else:
         labels = np.zeros(len(data))
         unique_labels = [0]
 
     if "ncpu" not in config:
-        config["ncpu"] = max(1, min(len(unique_labels) // 4, min(32, mp.cpu_count() - 1)))
+        config["ncpu"] = max(
+            1, min(len(unique_labels) // 4, min(32, mp.cpu_count() - 1))
+        )
     else:
         config["ncpu"] = min(mp.cpu_count(), config["ncpu"])
 
@@ -133,16 +204,18 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
             events.extend(events_)
             assignment.extend(assignment_)
     else:
-        manager = mp.Manager() # create a shared manager
-        lock = manager.Lock() 
+        manager = mp.Manager()  # create a shared manager
+        lock = manager.Lock()
         # event_idx0 - 1 as event_idx is increased before use
-        event_idx = manager.Value("i", event_idx0 - 1) # create a variable
+        event_idx = manager.Value("i", event_idx0 - 1)  # create a variable
 
         print(f"Associating {len(unique_labels)} clusters with {config['ncpu']} CPUs")
 
         # the following sort and shuffle is to make sure jobs are distributed evenly
-        counter = Counter(labels) # counting the frequency of each label
-        unique_labels = sorted(unique_labels, key=lambda x: counter[x], reverse=True) # based on the frequenct to sort the label
+        counter = Counter(labels)  # counting the frequency of each label
+        unique_labels = sorted(
+            unique_labels, key=lambda x: counter[x], reverse=True
+        )  # based on the frequenct to sort the label
         np.random.shuffle(unique_labels)
 
         # the default chunk_size is len(unique_labels)//(config["ncpu"]*4), which makes some jobs very heavy
@@ -176,8 +249,8 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
                         lock,
                     ]
                     for k in unique_labels
-                ], # this generate a list contains diff k as input
-                chunksize=chunk_size, # how many chunks would be allocated to the Process
+                ],  # this generate a list contains diff k as input
+                chunksize=chunk_size,  # how many chunks would be allocated to the Process
             )
             # resuts is a list of tuples, each tuple contains two lists events and assignment
             # here we flatten the list of tuples into two lists
@@ -205,7 +278,7 @@ def associate(
     event_idx,
     lock=None,
 ):
-    print(".", end="") # using end to ignore new line
+    print(".", end="")  # using end to ignore new line
 
     data_ = data[labels == k]
     locs_ = locs[labels == k]
@@ -219,7 +292,9 @@ def associate(
     if len(pick_idx_) < max(3, config["min_picks_per_eq"]):
         return [], []
 
-    time_range = max(data_[:, 0].max() - data_[:, 0].min(), 1) # 最晚的picks time - 最早的picks time
+    time_range = max(
+        data_[:, 0].max() - data_[:, 0].min(), 1
+    )  # 最晚的picks time - 最早的picks time
     if config["use_amplitude"]:
         amp_range = max(data_[:, 1].max() - data_[:, 1].min(), 1)
 
@@ -239,7 +314,9 @@ def associate(
         y_mean = np.average(locs_[:, 1], weights=weight)
         x_std = np.sqrt(np.average((locs_[:, 0] - x_mean) ** 2, weights=weight))
         y_std = np.sqrt(np.average((locs_[:, 1] - y_mean) ** 2, weights=weight))
-        logger.info(f"weight: {weight}\nx_mean: {x_mean}\ny_mean: {y_mean}\nx_std: {x_std}\ny_std: {y_std}")
+        logger.info(
+            f"weight: {weight}\nx_mean: {x_mean}\ny_mean: {y_mean}\nx_std: {x_std}\ny_std: {y_std}"
+        )
         # x_std = np.std(locs_[:, 0])
         # y_std = np.std(locs_[:, 1])
         # t_std = np.std(data_[:, 0])
@@ -253,7 +330,7 @@ def associate(
         ## option 4
         rstd = np.sqrt(x_std**2 + y_std**2)
         # scaler = max(10.0, (rstd / 6.0) * (rstd / 60.0))  # 6.0 km/s, 60 km
-        scaler = max(1.0, (rstd / 6.0) * (rstd / 60.0))  # 6.0 km/s, 60 km
+        scaler = max(1.0, (rstd / 6.0) * (rstd / 30.0))  # 6.0 km/s, 30 km
         logger.info(f"scaler: {scaler}")
         if config["use_amplitude"]:
             # covariance_prior_pre = [time_range * 10.0, amp_range * 10.0]
@@ -263,7 +340,9 @@ def associate(
             covariance_prior_pre = [scaler]
     # print(f"covariance_prior_pre: {covariance_prior_pre}")
     if config["use_amplitude"]:
-        covariance_prior = np.array([[covariance_prior_pre[0], 0.0], [0.0, covariance_prior_pre[1]]])
+        covariance_prior = np.array(
+            [[covariance_prior_pre[0], 0.0], [0.0, covariance_prior_pre[1]]]
+        )
     else:
         covariance_prior = np.array([[covariance_prior_pre[0]]])
         data_ = data_[:, 0:1]
@@ -319,7 +398,9 @@ def associate(
         tmp_locs = locs_[pred == i]
         tmp_pick_station_id = pick_station_id_[pred == i]
         tmp_phase_type = phase_type_[pred == i]
+        # tmp_phase_weight = phase_weight_[pred == i]
         if (len(tmp_data) == 0) or (len(tmp_data) < config["min_picks_per_eq"]):
+            # if (len(tmp_data) == 0) or (np.sum(tmp_phase_weight) < config["min_picks_per_eq"]):
             continue
         # idx_filter = np.ones(len(tmp_data)).astype(bool)
 
@@ -335,6 +416,7 @@ def associate(
         idx_t = (diff_t < config["max_sigma11"]).squeeze(axis=1)
         idx_filter = idx_t
         if len(tmp_data[idx_filter]) < config["min_picks_per_eq"]:
+            # if np.sum(tmp_phase_weight[idx_filter]) < config["min_picks_per_eq"]:
             continue
 
         ## filter multiple picks at the same station
@@ -347,13 +429,16 @@ def associate(
             idx_s[unique_sta_id[k][0]] = True
         idx_filter = idx_filter & idx_s
         if len(tmp_data[idx_filter]) < config["min_picks_per_eq"]:
+            # if np.sum(tmp_phase_weight[idx_filter]) < config["min_picks_per_eq"]:
             continue
         gmm.covariances_[i, 0, 0] = np.mean((diff_t[idx_t]) ** 2)
 
         ## filter by amplitude
         if config["use_amplitude"]:
             a_ = calc_amp(
-                gmm.centers_[i : i + 1, len(config["dims"]) + 1 : len(config["dims"]) + 2],
+                gmm.centers_[
+                    i : i + 1, len(config["dims"]) + 1 : len(config["dims"]) + 2
+                ],
                 gmm.centers_[i : i + 1, : len(config["dims"]) + 1],
                 tmp_locs,
             )
@@ -361,25 +446,35 @@ def associate(
             idx_a = (diff_a < config["max_sigma22"]).squeeze()
             idx_filter = idx_filter & idx_a
             if len(tmp_data[idx_filter]) < config["min_picks_per_eq"]:
+                # if np.sum(tmp_phase_weight[idx_filter]) < config["min_picks_per_eq"]:
                 continue
 
             if "max_sigma12" in config:
                 idx_cov = np.abs(gmm.covariances_[i, 0, 1]) < config["max_sigma12"]
                 idx_filter = idx_filter & idx_cov
                 if len(tmp_data[idx_filter]) < config["min_picks_per_eq"]:
+                    # if np.sum(tmp_phase_weight[idx_filter]) < config["min_picks_per_eq"]:
                     continue
 
             gmm.covariances_[i, 1, 1] = np.mean((diff_a[idx_a]) ** 2)
 
         if "min_p_picks_per_eq" in config:
-            if len(tmp_data[idx_filter & (tmp_phase_type == "p")]) < config["min_p_picks_per_eq"]:
+            if (
+                len(tmp_data[idx_filter & (tmp_phase_type == "p")])
+                < config["min_p_picks_per_eq"]
+            ):
+                # if np.sum(tmp_phase_weight[idx_filter & (tmp_phase_type == "p")]) < config["min_p_picks_per_eq"]:
                 continue
         if "min_s_picks_per_eq" in config:
-            if len(tmp_data[idx_filter & (tmp_phase_type == "s")]) < config["min_s_picks_per_eq"]:
+            if (
+                len(tmp_data[idx_filter & (tmp_phase_type == "s")])
+                < config["min_s_picks_per_eq"]
+            ):
+                # if np.sum(tmp_phase_weight[idx_filter & (tmp_phase_type == "s")]) < config["min_s_picks_per_eq"]:
                 continue
 
         if lock is not None:
-            with lock: # using with lock to ensure only one process pass.
+            with lock:  # using with lock to ensure only one process pass.
                 if not isinstance(event_idx, int):
                     event_idx.value += 1
                     event_idx_value = event_idx.value
@@ -396,13 +491,17 @@ def associate(
 
         event = {
             # "time": from_seconds(gmm.centers_[i, len(config["dims"])]),
-            "time": datetime.utcfromtimestamp(gmm.centers_[i, len(config["dims"])] + timestamp0).isoformat(
-                timespec="milliseconds"
-            ),
+            "time": datetime.utcfromtimestamp(
+                gmm.centers_[i, len(config["dims"])] + timestamp0
+            ).isoformat(timespec="milliseconds"),
             # "time(s)": gmm.centers_[i, len(config["dims"])],
-            "magnitude": gmm.centers_[i, len(config["dims"]) + 1] if config["use_amplitude"] else 999,
+            "magnitude": gmm.centers_[i, len(config["dims"]) + 1]
+            if config["use_amplitude"]
+            else 999,
             "sigma_time": np.sqrt(gmm.covariances_[i, 0, 0]),
-            "sigma_amp": np.sqrt(gmm.covariances_[i, 1, 1]) if config["use_amplitude"] else 0,
+            "sigma_amp": np.sqrt(gmm.covariances_[i, 1, 1])
+            if config["use_amplitude"]
+            else 0,
             "cov_time_amp": gmm.covariances_[i, 0, 1] if config["use_amplitude"] else 0,
             "gamma_score": prob_eq[i],
             "num_picks": len(tmp_data[idx_filter]),
@@ -504,17 +603,31 @@ def init_centers(config, data_, locs_, time_range, max_num_event=1):
     else:
         initial_points = [1, 1, 1]
 
-    num_t_init = min(max(int(max_num_event * config["oversample_factor"]), 1), len(data_)) 
+    num_t_init = min(
+        max(int(max_num_event * config["oversample_factor"]), 1), len(data_)
+    )
 
-    index = np.argsort(data_[:, 0])[:: max(len(data_) // num_t_init, 1)][:num_t_init] 
-    t_init = data_[index, 0] # selecting initial time in specific step (which is index)
+    index = np.argsort(data_[:, 0])[:: max(len(data_) // num_t_init, 1)][:num_t_init]
+    t_init = data_[index, 0]
+    x_init = locs_[:, 0][
+        index
+    ]  # + np.random.uniform(low=-1, high=1, size=num_t_init) * np.std(locs_[:, 0])
+    y_init = locs_[:, 1][
+        index
+    ]  # + np.random.uniform(low=-1, high=1, size=num_t_init) * np.std(locs_[:, 1])
+    index = np.argsort(data_[:, 0])[:: max(len(data_) // num_t_init, 1)][:num_t_init]
+    t_init = data_[index, 0]  # selecting initial time in specific step (which is index)
     x_init = locs_[:, 0][index]
     y_init = locs_[:, 1][index]
     # x_init, y_init = np.mean(locs_[:, 0]), np.mean(locs_[:, 1])
     # x_init = np.broadcast_to(x_init, (num_t_init)).reshape(-1)
     # y_init = np.broadcast_to(y_init, (num_t_init)).reshape(-1)
-    z_init = np.linspace(config["z(km)"][0], config["z(km)"][1], initial_points[2] + 2)[1:-1] # select the middle item
-    z_init = np.broadcast_to(z_init, (num_t_init)).reshape(-1) # creating the depth part following the array size above
+    z_init = np.linspace(config["z(km)"][0], config["z(km)"][1], initial_points[2] + 2)[
+        1:-1
+    ]  # select the middle item
+    z_init = np.broadcast_to(z_init, (num_t_init)).reshape(
+        -1
+    )  # creating the depth part following the array size above
 
     if config["dims"] == ["x(km)", "y(km)", "z(km)"]:
         centers_init = np.vstack([x_init, y_init, z_init, t_init]).T
@@ -526,6 +639,8 @@ def init_centers(config, data_, locs_, time_range, max_num_event=1):
         raise (ValueError("Unsupported dims"))
 
     if config["use_amplitude"]:
-        centers_init = np.hstack([centers_init, 1.0 * np.ones((len(centers_init), 1))])  # init magnitude to 1.0
+        centers_init = np.hstack(
+            [centers_init, 1.0 * np.ones((len(centers_init), 1))]
+        )  # init magnitude to 1.0
 
     return centers_init
